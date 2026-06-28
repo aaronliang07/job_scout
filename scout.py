@@ -519,6 +519,7 @@ def is_valid_job(job: dict) -> tuple[bool, str | None]:
 
 def evaluate_job(client, job):
     log.info(f"Evaluating {job['title']}")
+
     prompt = f"""
 Title: {job['title']}
 Company: {job['company']}
@@ -526,25 +527,30 @@ Location: {job['location']}
 Description:
 {job['description'][:2000]}
 """
+
     resp = client.messages.create(
-    model="claude-sonnet-4-6",
-    max_tokens=500,
-    system=MATCHING_CRITERIA,
-    messages=[{"role": "user", "content": prompt}],
-    temperature=0
-)
+        model="claude-sonnet-4-6",
+        max_tokens=500,
+        system=MATCHING_CRITERIA,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
     text = resp.content[0].text.strip()
-    
+
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError(f"No JSON found in Claude output: {text[:200]}")
-    
-    return json.loads(match.group(0))
+
+    result = json.loads(match.group(0))
 
     bd = result.get("breakdown", {})
+
+    overall = result.get("score")
+
     log.info(
         f"Score breakdown → "
-        f"overall={result.get('score')} | "
+        f"overall={overall} | "
         f"career={bd.get('career_work_quality')} | "
         f"company={bd.get('company_interest')} | "
         f"impact={bd.get('impact')} | "
