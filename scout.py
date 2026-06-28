@@ -13,6 +13,7 @@ import os
 import json
 import hashlib
 import logging
+import time
 import re
 import requests
 from datetime import datetime
@@ -30,7 +31,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 SEEN_JOBS_FILE = Path("data/seen_jobs.json")
 
-# ── Claude Matching Criteria (FULL RUBRIC RESTORED) ──────────────────────────
+# ── Claude Matching Criteria ──────────────────────────────────────────────────
 
 MATCHING_CRITERIA = """
 You are evaluating job postings for Aaron, a Senior Product Data Analyst based in Toronto.
@@ -192,7 +193,7 @@ def job_id(job: dict) -> str:
     raw = job.get("url") or f"{job.get('title','')}|{job.get('company','')}"
     return hashlib.md5(raw.encode()).hexdigest()
 
-# ── ATS NORMALIZATION LAYER ───────────────────────────────────────────────────
+# ── ATS normalization ─────────────────────────────────────────────────────────
 
 def normalize_job(job: dict, source: str) -> dict:
     return {
@@ -206,46 +207,26 @@ def normalize_job(job: dict, source: str) -> dict:
 
 def safe_normalize(job: dict, source: str) -> dict:
     j = normalize_job(job, source)
-
-    if not j["title"]:
-        j["title"] = "Unknown Title"
-    if not j["location"]:
-        j["location"] = "Unknown"
-    if not j["description"]:
-        j["description"] = ""
-
+    if not j["title"]:    j["title"] = "Unknown Title"
+    if not j["location"]: j["location"] = "Unknown"
+    if not j["description"]: j["description"] = ""
     return j
 
-# ── Stage 1: INGESTION (NO FILTERING) ─────────────────────────────────────────
+# ── Stage 1: Ingestion ────────────────────────────────────────────────────────
 
 def fetch_adzuna():
     log.info("Fetching Adzuna...")
     jobs = []
-
     queries = [
-        "data analyst SQL",
-        "product analyst",
-        "product analytics",
-        "analytics engineer",
-        "data scientist product",
-        "growth analyst",
-        "business analyst SQL",
-        "business operations analyst",
-        "bizops analyst",
-        "strategy analyst",
-        "operations analyst",
-        "revenue operations analyst",
-        "product operations",
-        "product manager analytics",
-        "growth product manager",
-        "experiment analyst",
-        "A/B testing analyst",
-        "customer analytics",
+        "data analyst SQL", "product analyst", "product analytics",
+        "analytics engineer", "data scientist product", "growth analyst",
+        "business analyst SQL", "business operations analyst", "bizops analyst",
+        "strategy analyst", "operations analyst", "revenue operations analyst",
+        "product operations", "product manager analytics", "growth product manager",
+        "experiment analyst", "A/B testing analyst", "customer analytics",
         "marketing analytics",
     ]
-
     base = "https://api.adzuna.com/v1/api/jobs/ca/search/1"
-
     for q in queries:
         try:
             r = requests.get(base, params={
@@ -255,9 +236,7 @@ def fetch_adzuna():
                 "where": "Toronto",
                 "results_per_page": 20,
             }, timeout=15)
-
             r.raise_for_status()
-
             for item in r.json().get("results", []):
                 jobs.append(safe_normalize({
                     "title": item.get("title", ""),
@@ -268,13 +247,11 @@ def fetch_adzuna():
                     "salary_min": item.get("salary_min"),
                     "salary_max": item.get("salary_max"),
                 }, "adzuna"))
-
         except Exception as e:
-            log.warning(f"Adzuna failed for {q}: {e}")
-
+            log.warning(f"  Adzuna query '{q}' failed: {e}")
+    log.info(f"  Adzuna: {len(jobs)} raw jobs")
     return jobs
 
-# ── ATS SOURCES ───────────────────────────────────────────────────────────────
 
 def fetch_greenhouse(slug: str):
     url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
@@ -282,7 +259,6 @@ def fetch_greenhouse(slug: str):
         r = requests.get(url, timeout=10)
         if r.status_code in (404, 410):
             return []
-
         jobs = []
         for item in r.json().get("jobs", []):
             jobs.append(safe_normalize({
@@ -292,9 +268,7 @@ def fetch_greenhouse(slug: str):
                 "description": item.get("content", "")[:3000],
                 "url": item.get("absolute_url", ""),
             }, f"greenhouse/{slug}"))
-
         return jobs
-
     except Exception:
         return []
 
@@ -305,7 +279,6 @@ def fetch_lever(slug: str):
         r = requests.get(url, timeout=10)
         if r.status_code == 404:
             return []
-
         jobs = []
         for item in r.json():
             jobs.append(safe_normalize({
@@ -315,9 +288,7 @@ def fetch_lever(slug: str):
                 "description": item.get("descriptionPlain", "")[:3000],
                 "url": item.get("hostedUrl", ""),
             }, f"lever/{slug}"))
-
         return jobs
-
     except Exception:
         return []
 
@@ -328,7 +299,6 @@ def fetch_workable(slug: str):
         r = requests.post(url, json={"query": "", "limit": 100}, timeout=10)
         if r.status_code in (404, 422):
             return []
-
         jobs = []
         for item in r.json().get("results", []):
             jobs.append(safe_normalize({
@@ -338,36 +308,35 @@ def fetch_workable(slug: str):
                 "description": item.get("description", "")[:3000],
                 "url": f"https://apply.workable.com/{slug}/j/{item.get('shortcode','')}",
             }, f"workable/{slug}"))
-
         return jobs
-
     except Exception:
         return []
 
-# ── Stage 2: OBJECTIVE FILTERING ──────────────────────────────────────────────
+# ── Stage 2: Objective filtering ──────────────────────────────────────────────
 
-def is_valid_job(job: dict) -> bool:
+def is_valid_job(job: dict) -> tuple[bool, str | None]:
+    """Returns (is_valid, rejection_reason). rejection_reason is None if valid."""
     title = (job.get("title") or "").lower()
     desc  = (job.get("description") or "").lower()
     text  = f"{title} {desc}"
 
-    # Filter 1: no engineer titles
-    if "engineer" in title:
-        return False
-
-    # Filter 2: must contain SQL or Python
-    if not ("sql" in text or "python" in text):
-        return False
-
-    # basic validity
     if not job.get("title") or not job.get("url"):
-        return False
+        return False, "missing_title_or_url"
 
-    return True
+    if "engineer" in title:
+        return False, "engineer_title"
 
-# ── Stage 3: CLAUDE EVALUATION ───────────────────────────────────────────────
+    if not ("sql" in text or "python" in text):
+        return False, "no_sql_or_python"
+
+    return True, None
+
+# ── Stage 3: Claude evaluation ────────────────────────────────────────────────
 
 def evaluate_job(client, job: dict):
+    log.info(f"  Evaluating: {job['title']} @ {job['company']}")
+
+    t0 = time.time()
     prompt = f"""
 Title: {job['title']}
 Company: {job['company']}
@@ -377,7 +346,6 @@ Salary: {job.get('salary_min')} – {job.get('salary_max')}
 Description:
 {job['description'][:2500]}
 """
-
     try:
         resp = client.messages.create(
             model="claude-sonnet-4-6",
@@ -385,66 +353,125 @@ Description:
             system=MATCHING_CRITERIA,
             messages=[{"role": "user", "content": prompt}],
         )
+        elapsed = time.time() - t0
+        result = json.loads(resp.content[0].text.strip())
 
-        return json.loads(resp.content[0].text.strip())
+        bd = result.get("breakdown", {})
+        recommend = result.get("recommend", False)
+        score = result.get("score", "?")
+        flag = "✅ MATCH" if recommend else "✗  skip"
+
+        log.info(
+            f"    {flag} | score: {score}/10 | "
+            f"career: {bd.get('career_work_quality','?')} "
+            f"company: {bd.get('company_interest','?')} "
+            f"impact: {bd.get('impact','?')} "
+            f"logistics: {bd.get('logistics','?')} "
+            f"| {elapsed:.1f}s"
+        )
+        if not recommend:
+            log.info(f"    reason: {result.get('reason','')[:120]}")
+
+        return result
 
     except Exception as e:
-        log.warning(f"Claude eval failed: {e}")
+        elapsed = time.time() - t0
+        log.warning(f"    Claude eval failed ({elapsed:.1f}s): {e}")
         return None
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    run_start = time.time()
     log.info("=== Job Scout starting ===")
 
     seen = load_set(SEEN_JOBS_FILE)
+    log.info(f"Previously seen: {len(seen)} jobs")
 
-    all_jobs = []
-    all_jobs += fetch_adzuna()
+    # ── Ingestion ──
+    log.info("--- Stage 1: Ingestion ---")
+    t0 = time.time()
 
-    for slug in ["riotgames", "figma", "shopify"]:
-        all_jobs += fetch_greenhouse(slug)
+    source_jobs: dict[str, list] = {}
 
-    for slug in ["discord", "substack"]:
-        all_jobs += fetch_lever(slug)
+    adzuna = fetch_adzuna()
+    source_jobs["adzuna"] = adzuna
 
-    for slug in ["koho", "wattpad"]:
-        all_jobs += fetch_workable(slug)
+    greenhouse_slugs = ["riotgames", "figma", "shopify"]
+    for slug in greenhouse_slugs:
+        jobs = fetch_greenhouse(slug)
+        source_jobs[f"greenhouse/{slug}"] = jobs
+        log.info(f"  greenhouse/{slug}: {len(jobs)} raw jobs")
 
-    log.info(f"Ingested: {len(all_jobs)} jobs")
+    lever_slugs = ["discord", "substack"]
+    for slug in lever_slugs:
+        jobs = fetch_lever(slug)
+        source_jobs[f"lever/{slug}"] = jobs
+        log.info(f"  lever/{slug}: {len(jobs)} raw jobs")
 
+    workable_slugs = ["koho", "wattpad"]
+    for slug in workable_slugs:
+        jobs = fetch_workable(slug)
+        source_jobs[f"workable/{slug}"] = jobs
+        log.info(f"  workable/{slug}: {len(jobs)} raw jobs")
+
+    all_jobs = [job for jobs in source_jobs.values() for job in jobs]
+    log.info(f"Ingestion complete: {len(all_jobs)} total raw jobs ({time.time()-t0:.1f}s)")
+
+    # ── Deduplication + filtering ──
+    log.info("--- Stage 2: Dedup + Objective filtering ---")
+    filter_counts = {"already_seen": 0, "engineer_title": 0, "no_sql_or_python": 0, "missing_title_or_url": 0}
     new_jobs = []
+
     for job in all_jobs:
         jid = job_id(job)
-
         if jid in seen:
+            filter_counts["already_seen"] += 1
             continue
-
-        if not is_valid_job(job):
+        valid, reason = is_valid_job(job)
+        if not valid:
+            filter_counts[reason] += 1
             continue
-
         new_jobs.append(job)
 
-    log.info(f"After filtering: {len(new_jobs)} jobs")
+    log.info(f"  Already seen:        {filter_counts['already_seen']}")
+    log.info(f"  Engineer title:      {filter_counts['engineer_title']}")
+    log.info(f"  No SQL or Python:    {filter_counts['no_sql_or_python']}")
+    log.info(f"  Missing title/URL:   {filter_counts['missing_title_or_url']}")
+    log.info(f"  Passed filters:      {len(new_jobs)}")
 
     if not new_jobs:
-        log.info("No jobs to evaluate")
+        log.info("No new jobs to evaluate.")
+        save_set(SEEN_JOBS_FILE, seen)
+        log.info(f"=== Done in {time.time()-run_start:.1f}s ===")
         return
 
+    # ── Claude evaluation ──
+    log.info("--- Stage 3: Claude evaluation ---")
+    t0 = time.time()
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
     matches = []
 
     for job in new_jobs:
         result = evaluate_job(client, job)
         seen.add(job_id(job))
-
         if result and result.get("recommend"):
             matches.append((job, result))
 
+    eval_time = time.time() - t0
+    log.info(f"Evaluation complete: {len(new_jobs)} jobs in {eval_time:.1f}s ({eval_time/len(new_jobs):.1f}s avg)")
+
     save_set(SEEN_JOBS_FILE, seen)
 
-    log.info(f"Matches: {len(matches)}")
+    # ── Final summary ──
+    total_time = time.time() - run_start
+    log.info("--- Run summary ---")
+    log.info(f"  Total ingested:      {len(all_jobs)}")
+    log.info(f"  Already seen:        {filter_counts['already_seen']}")
+    log.info(f"  Filtered out:        {filter_counts['engineer_title'] + filter_counts['no_sql_or_python'] + filter_counts['missing_title_or_url']}")
+    log.info(f"  Evaluated by Claude: {len(new_jobs)}")
+    log.info(f"  Matches:             {len(matches)}")
+    log.info(f"  Total time:          {total_time:.1f}s")
     log.info("=== Done ===")
 
 
