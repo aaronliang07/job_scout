@@ -533,9 +533,13 @@ Description:
     messages=[{"role": "user", "content": prompt}],
     temperature=0
 )
-    if not resp.content or not resp.content[0].text:
-        raise ValueError("Empty Claude response")
-    return json.loads(resp.content[0].text)
+    text = resp.content[0].text.strip()
+    
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON found in Claude output: {text[:200]}")
+    
+    return json.loads(match.group(0))
 
 
 # ── MAIN (UNCHANGED STRUCTURE) ──────────────────────────────────────────────
