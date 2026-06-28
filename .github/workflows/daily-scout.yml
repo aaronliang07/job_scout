@@ -19,7 +19,7 @@ jobs:
       - name: Restore data cache
         uses: actions/cache@v4
         with:
-          path: data/
+          path: seen_jobs.json
           key: scout-data-${{ github.run_id }}
           restore-keys: |
             scout-data-
