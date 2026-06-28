@@ -436,14 +436,6 @@ def fetch_ats_batch(label: str, slugs: list[str], fetch_fn) -> list[dict]:
 # ── MaRS Getro job board ──────────────────────────────────────────────────────
 
 def fetch_mars_jobs() -> list[dict]:
-    """
-    Fetch jobs from the MaRS tech job board (techjobs.marsdd.com), which is
-    powered by Getro. Getro boards expose a paginated JSON endpoint at
-    /api/v1/jobs. Falls back gracefully if the endpoint shape has changed.
-
-    To verify the endpoint is live, open browser devtools on
-    https://techjobs.marsdd.com/jobs and look for XHR calls to /api/v1/jobs.
-    """
     log.info("Fetching MaRS jobs (Getro)...")
     jobs = []
     base_url = "https://techjobs.marsdd.com"
@@ -463,7 +455,6 @@ def fetch_mars_jobs() -> list[dict]:
                 timeout=15,
             )
             if r.status_code == 404:
-                # Endpoint path didn't work — log clearly so it's easy to debug
                 log.warning(
                     "MaRS Getro endpoint returned 404. "
                     "Check the live XHR calls at techjobs.marsdd.com/jobs "
@@ -475,7 +466,6 @@ def fetch_mars_jobs() -> list[dict]:
                 break
 
             data = r.json()
-            # Getro boards typically return { jobs: [...], meta: { total_pages: N } }
             items = data.get("jobs") or data.get("results") or []
             if not items:
                 break
@@ -495,13 +485,12 @@ def fetch_mars_jobs() -> list[dict]:
                     "url": item.get("url") or item.get("job_url") or item.get("apply_url") or "",
                 }, "mars_getro"))
 
-            # Check pagination
             meta = data.get("meta") or data.get("pagination") or {}
             total_pages = meta.get("total_pages") or meta.get("pages") or 1
             if page >= total_pages:
                 break
             page += 1
-            time.sleep(0.5)  # be polite
+            time.sleep(0.5)
 
         except Exception as e:
             log.warning(f"MaRS Getro page {page} failed: {e}")
@@ -511,18 +500,9 @@ def fetch_mars_jobs() -> list[dict]:
     return jobs
 
 
-# ── Wellfound SEO pages (Option A — no auth, public pages) ───────────────────
+# ── Wellfound SEO pages ───────────────────────────────────────────────────────
 
 def fetch_wellfound_seo() -> list[dict]:
-    """
-    Scrape Wellfound's public SEO landing pages at
-    /role/l/<role-slug>/toronto. These pages are unauthenticated and embed
-    job data as Apollo GraphQL state in a <script id="__NEXT_DATA__"> tag.
-
-    Note: The Apollo state key structure can change when Wellfound updates
-    their frontend. If this returns 0 jobs, inspect the __NEXT_DATA__ JSON
-    at one of the URLs to find the current key paths.
-    """
     log.info("Fetching Wellfound SEO pages...")
     jobs = []
     headers = {
@@ -559,7 +539,6 @@ def fetch_wellfound_seo() -> list[dict]:
             for key, val in apollo.items():
                 if not isinstance(val, dict):
                     continue
-                # Wellfound uses keys like "JobListing:12345" or "StartupRole:12345"
                 if not (key.startswith("JobListing:") or key.startswith("StartupRole:")):
                     continue
 
@@ -567,12 +546,10 @@ def fetch_wellfound_seo() -> list[dict]:
                 if not title:
                     continue
 
-                # Company name may be a nested ref or inline string
                 startup = val.get("startup") or {}
                 if isinstance(startup, dict):
                     company_name = startup.get("name", "")
                 else:
-                    # It's an Apollo ref like {"__ref": "Startup:123"} — look it up
                     ref = startup.get("__ref", "")
                     startup_obj = apollo.get(ref, {})
                     company_name = startup_obj.get("name", "") if isinstance(startup_obj, dict) else ""
@@ -591,7 +568,7 @@ def fetch_wellfound_seo() -> list[dict]:
                 found_on_page += 1
 
             log.info(f"Wellfound SEO {role_slug}: {found_on_page} jobs")
-            time.sleep(1.0)  # respectful crawl rate
+            time.sleep(1.0)
 
         except Exception as e:
             log.warning(f"Wellfound SEO {role_slug} failed: {e}")
@@ -600,14 +577,9 @@ def fetch_wellfound_seo() -> list[dict]:
     return jobs
 
 
-# ── Remotive free API (Option B — startup-heavy remote jobs) ─────────────────
+# ── Remotive free API ─────────────────────────────────────────────────────────
 
 def fetch_remotive() -> list[dict]:
-    """
-    Remotive is a startup-heavy remote job board with a free, open JSON API.
-    No auth, no scraping — plain GET requests. Jobs are remote-only so
-    location is always eligible; Claude's logistics score handles fit.
-    """
     log.info("Fetching Remotive...")
     jobs = []
 
@@ -637,62 +609,112 @@ def fetch_remotive() -> list[dict]:
     return jobs
 
 
-# ── YC DISCOVERY ─────────────────────────────────────────────────────────────
+# ── YC DISCOVERY (via yc-oss/api static mirror) ───────────────────────────────
 
-def fetch_yc_companies():
-    """
-    Fetch YC companies via Algolia. The __NEXT_DATA__ approach on
-    ycombinator.com/companies no longer works (infinite scroll SPA).
-    This queries the Algolia index directly with isHiring:true to avoid
-    probing dead companies, paginating through the full result set.
-    """
-    log.info("Fetching YC companies via Algolia...")
-    companies = []
-    page = 0
+# Base URL for the community-maintained daily mirror of YC's Algolia index.
+# Unlike Algolia's public key (which embeds a validUntil and rotates), this
+# mirror is static JSON on raw.githubusercontent.com and never requires auth.
+_YC_OSS_BASE = "https://raw.githubusercontent.com/yc-oss/api/main/companies"
 
-    while True:
+# Map each of our relevant tags to the per-tag JSON file in the mirror.
+# Files live at <base>/<tag-slug>.json (spaces → hyphens, lowercase).
+# Tags not present in the repo fall back to the full hiring.json filter.
+_YC_TAG_SLUGS = {
+    "gaming":           "gaming",
+    "consumer":         "consumer",
+    "education":        "education",
+    "edtech":           "edtech",
+    "health":           "health",
+    "healthcare":       "healthcare",
+    "entertainment":    "entertainment",
+    "media":            "media",
+    "fitness":          "fitness",
+    "mental health":    "mental-health",
+    "marketplace":      "marketplace",
+    "productivity":     "productivity",
+    "community":        "community",
+    "sports":           "sports",
+    "creator economy":  "creator-economy",
+    "social":           "social",
+    "food":             "food",
+    "food and beverage":"food-and-beverage",
+    "travel":           "travel",
+    "music":            "music",
+    "art":              "art",
+    "climate":          "climate",
+    "sustainability":   "sustainability",
+    "developer tools":  "developer-tools",
+    "retail":           "retail",
+    "e-commerce":       "e-commerce",
+}
+
+
+def fetch_yc_companies() -> list[dict]:
+    """
+    Fetch YC hiring companies from the yc-oss/api community mirror.
+
+    Strategy:
+    1. Try each per-tag JSON file (these are small and pre-filtered).
+    2. Fall back to the full hiring.json and filter client-side if a tag
+       file 404s (the repo may not have every tag as a separate file yet).
+
+    Returns a deduplicated list of dicts with keys: name, slug, tags.
+    """
+    log.info("Fetching YC companies via yc-oss/api mirror...")
+
+    seen_slugs: set[str] = set()
+    companies: list[dict] = []
+
+    headers = {"Accept": "application/json"}
+
+    for tag, tag_slug in _YC_TAG_SLUGS.items():
+        url = f"{_YC_OSS_BASE}/{tag_slug}.json"
         try:
-            r = requests.post(
-                "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries",
-                headers={
-                    "X-Algolia-Application-Id": "45BWZJ1SGC",
-                    # Public read-only key from YC's own frontend
-                    "X-Algolia-API-Key": "MjBjYjRiMzY0NzdhZWY0NjExY2NhZjYxMGIxYjc2MTAwNWFkNTkwNTc4NjgxYjU0",
-                    "Content-Type": "application/json",
-                },
-                json={"requests": [{
-                    "indexName": "YCCompany_production",
-                    "params": f"hitsPerPage=100&page={page}&filters=isHiring%3Atrue",
-                }]},
-                timeout=15,
-            )
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 404:
+                log.debug(f"YC tag file not found: {tag_slug}.json — will rely on hiring.json fallback")
+                continue
             r.raise_for_status()
-            hits = r.json()["results"][0]["hits"]
-            if not hits:
-                break
-            companies.extend(hits)
-            page += 1
-            if page > 60:  # safety ceiling (~6000 companies)
-                break
-            time.sleep(0.2)
+            for co in r.json():
+                if not co.get("isHiring", True):  # mirror may include non-hiring; skip them
+                    continue
+                slug = co.get("slug") or re.sub(r"[^a-z0-9]+", "-", co.get("name", "").lower())
+                if slug in seen_slugs:
+                    continue
+                seen_slugs.add(slug)
+                companies.append({
+                    "name": co.get("name", ""),
+                    "slug": slug,
+                    "tags": co.get("tags") or [tag],
+                })
         except Exception as e:
-            log.warning(f"YC Algolia page {page} failed: {e}")
-            break
+            log.warning(f"YC tag '{tag_slug}' fetch failed: {e}")
 
-    log.info(f"YC Algolia: {len(companies)} hiring companies fetched")
-    return _filter_yc_companies(companies)
+    # Fallback: if we got nothing from tag files, load the full hiring list
+    # and filter client-side by YC_RELEVANT_TAGS.
+    if not companies:
+        log.info("YC tag files returned nothing — falling back to hiring.json")
+        try:
+            r = requests.get(f"{_YC_OSS_BASE}/hiring.json", headers=headers, timeout=20)
+            r.raise_for_status()
+            for co in r.json():
+                co_tags = set(t.lower() for t in (co.get("tags") or []))
+                if not co_tags & YC_RELEVANT_TAGS:
+                    continue
+                slug = co.get("slug") or re.sub(r"[^a-z0-9]+", "-", co.get("name", "").lower())
+                if slug in seen_slugs:
+                    continue
+                seen_slugs.add(slug)
+                companies.append({
+                    "name": co.get("name", ""),
+                    "slug": slug,
+                    "tags": list(co_tags),
+                })
+        except Exception as e:
+            log.warning(f"YC hiring.json fallback failed: {e}")
 
-
-def _filter_yc_companies(raw):
-    results = []
-    for co in raw:
-        tags = set([t.lower() for t in (co.get("tags") or [])])
-        if not tags.intersection(YC_RELEVANT_TAGS):
-            continue
-        name = co.get("name", "")
-        slug = co.get("slug") or re.sub(r"[^a-z0-9]+", "-", name.lower())
-        results.append({"name": name, "slug": slug, "tags": list(tags)})
-    return results
+    log.info(f"YC mirror: {len(companies)} relevant hiring companies")
+    return companies
 
 
 def probe_company_all_ats(name, slug):
@@ -738,12 +760,9 @@ def is_valid_job(job: dict) -> tuple[bool, str | None]:
     if "engineer" in title:
         return False, "engineer_title"
 
-    if not ("sql" in text or "python" in text):
-        return False, "no_sql_or_python"
+    if not ("sql" in text):
+        return False, "no_sql"
 
-    # Adzuna results get location-filtered; ATS/Wellfound/Remotive sources
-    # have already been scoped to Toronto/remote at query time, or are
-    # remote-only (Remotive), so we let Claude handle logistics scoring.
     if job.get("source") == "adzuna":
         if not (
             "canada" in location or
