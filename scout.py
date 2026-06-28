@@ -211,7 +211,7 @@ This is a feasibility filter only.
 
 OUTPUT FORMAT (STRICT)
 
-Return ONLY JSON:
+Return ONLY JSON (Do not include markdown or backticks):
 {
   "recommend": true or false,
   "score": 1-10,
@@ -225,6 +225,7 @@ Return ONLY JSON:
   "highlights": ["max 3 positives"],
   "flags": ["max 3 concerns"]
 }
+
 """
 
 # ── Seen tracking ─────────────────────────────────────────────────────────────
@@ -526,11 +527,14 @@ Description:
 {job['description'][:2000]}
 """
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
-        system=MATCHING_CRITERIA,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    model="claude-sonnet-4-6",
+    max_tokens=500,
+    system=MATCHING_CRITERIA,
+    messages=[{"role": "user", "content": prompt}],
+    temperature=0
+)
+    if not resp.content or not resp.content[0].text:
+        raise ValueError("Empty Claude response")
     return json.loads(resp.content[0].text)
 
 
