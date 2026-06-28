@@ -1,0 +1,43 @@
+name: Daily Job Scout
+
+on:
+  schedule:
+    # Runs every weekday at 8am Toronto time (1pm UTC)
+    - cron: "0 13 * * 1-5"
+  workflow_dispatch:  # also allows manual trigger from GitHub UI
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Restore seen_jobs.json from previous run so we don't re-evaluate
+      # jobs we've already processed. Uses GitHub Actions cache keyed by date.
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: scout-data-${{ github.run_id }}
+          restore-keys: |
+            scout-data-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Job Scout
+        env:
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_RECIPIENT: ${{ secrets.GMAIL_RECIPIENT }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python src/scout.py
