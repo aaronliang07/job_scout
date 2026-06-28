@@ -549,12 +549,14 @@ Description:
     overall = result.get("score")
 
     log.info(
-        f"Score breakdown → "
-        f"overall={overall} | "
-        f"career={bd.get('career_work_quality')} | "
-        f"company={bd.get('company_interest')} | "
-        f"impact={bd.get('impact')} | "
-        f"logistics={bd.get('logistics')}"
+        f"\n"
+        f"JOB: {job['title']} @ {job['company']}\n"
+        f"URL: {job.get('url')}\n"
+        f"Score: {overall}\n"
+        f"  career={bd.get('career_work_quality')}\n"
+        f"  company={bd.get('company_interest')}\n"
+        f"  impact={bd.get('impact')}\n"
+        f"  logistics={bd.get('logistics')}\n"
     )
 
     return result
