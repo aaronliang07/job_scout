@@ -541,6 +541,17 @@ Description:
     
     return json.loads(match.group(0))
 
+    bd = result.get("breakdown", {})
+    log.info(
+        f"Score breakdown → "
+        f"overall={result.get('score')} | "
+        f"career={bd.get('career_work_quality')} | "
+        f"company={bd.get('company_interest')} | "
+        f"impact={bd.get('impact')} | "
+        f"logistics={bd.get('logistics')}"
+    )
+
+    return result
 
 # ── MAIN (UNCHANGED STRUCTURE) ──────────────────────────────────────────────
 
