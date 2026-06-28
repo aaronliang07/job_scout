@@ -2,11 +2,11 @@
 Job Scout — Daily job search engine for Aaron
 
 Architecture:
-1. Ingestion (raw ATS + Adzuna, no filtering)
+1. Ingestion (raw ATS + Adzuna + MaRS + Wellfound + Remotive, no filtering)
 2. ATS normalization layer (canonical schema)
 3. Objective filtering (SQL/Python + non-engineer rule)
 4. Claude scoring (structured rubric)
-5. Optional email digest
+5. Email digest for scores >= 8
 """
 
 import os
@@ -15,8 +15,11 @@ import hashlib
 import logging
 import time
 import re
+import smtplib
 import requests
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from anthropic import Anthropic
 
@@ -28,6 +31,11 @@ log = logging.getLogger(__name__)
 ADZUNA_APP_ID     = os.environ["ADZUNA_APP_ID"]
 ADZUNA_APP_KEY    = os.environ["ADZUNA_APP_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GMAIL_SENDER      = os.environ["GMAIL_SENDER"]
+GMAIL_RECIPIENT   = os.environ["GMAIL_RECIPIENT"]
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+
+SCORE_THRESHOLD = 8
 
 SEEN_JOBS_FILE      = Path("data/seen_jobs.json")
 SEEN_YC_SLUGS_FILE  = Path("data/seen_yc_slugs.json")
@@ -78,6 +86,27 @@ ASHBY_COMPANIES = [
     "belong", "dayoneapp",
     "cohere",
     "properly",
+]
+
+# ── Wellfound role slugs to query ─────────────────────────────────────────────
+
+WELLFOUND_ROLES = [
+    "data-analyst",
+    "product-analyst",
+    "analytics-engineer",
+    "data-scientist",
+    "growth-analyst",
+    "business-analyst",
+]
+
+# ── Remotive search terms ─────────────────────────────────────────────────────
+
+REMOTIVE_SEARCHES = [
+    "data analyst",
+    "product analyst",
+    "analytics engineer",
+    "growth analyst",
+    "business intelligence",
 ]
 
 # ── Claude matching criteria ──────────────────────────────────────────────────
@@ -404,21 +433,254 @@ def fetch_ats_batch(label: str, slugs: list[str], fetch_fn) -> list[dict]:
     return all_jobs
 
 
-# ── YC DISCOVERY (UNCHANGED ORIGINAL RESTORED) ───────────────────────────────
+# ── MaRS Getro job board ──────────────────────────────────────────────────────
+
+def fetch_mars_jobs() -> list[dict]:
+    """
+    Fetch jobs from the MaRS tech job board (techjobs.marsdd.com), which is
+    powered by Getro. Getro boards expose a paginated JSON endpoint at
+    /api/v1/jobs. Falls back gracefully if the endpoint shape has changed.
+
+    To verify the endpoint is live, open browser devtools on
+    https://techjobs.marsdd.com/jobs and look for XHR calls to /api/v1/jobs.
+    """
+    log.info("Fetching MaRS jobs (Getro)...")
+    jobs = []
+    base_url = "https://techjobs.marsdd.com"
+    page = 1
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://techjobs.marsdd.com/jobs",
+    }
+
+    while True:
+        try:
+            r = requests.get(
+                f"{base_url}/api/v1/jobs",
+                params={"page": page, "per_page": 100},
+                headers=headers,
+                timeout=15,
+            )
+            if r.status_code == 404:
+                # Endpoint path didn't work — log clearly so it's easy to debug
+                log.warning(
+                    "MaRS Getro endpoint returned 404. "
+                    "Check the live XHR calls at techjobs.marsdd.com/jobs "
+                    "to confirm the current API path."
+                )
+                break
+            if r.status_code != 200:
+                log.warning(f"MaRS Getro returned {r.status_code} on page {page}")
+                break
+
+            data = r.json()
+            # Getro boards typically return { jobs: [...], meta: { total_pages: N } }
+            items = data.get("jobs") or data.get("results") or []
+            if not items:
+                break
+
+            for item in items:
+                company_info = item.get("company") or item.get("startup") or {}
+                company_name = (
+                    company_info.get("name")
+                    if isinstance(company_info, dict)
+                    else str(company_info)
+                )
+                jobs.append(safe_normalize({
+                    "title": item.get("title", ""),
+                    "company": company_name or "Unknown",
+                    "location": item.get("location") or item.get("city") or "Toronto",
+                    "description": item.get("description") or item.get("body") or "",
+                    "url": item.get("url") or item.get("job_url") or item.get("apply_url") or "",
+                }, "mars_getro"))
+
+            # Check pagination
+            meta = data.get("meta") or data.get("pagination") or {}
+            total_pages = meta.get("total_pages") or meta.get("pages") or 1
+            if page >= total_pages:
+                break
+            page += 1
+            time.sleep(0.5)  # be polite
+
+        except Exception as e:
+            log.warning(f"MaRS Getro page {page} failed: {e}")
+            break
+
+    log.info(f"MaRS: {len(jobs)} raw jobs")
+    return jobs
+
+
+# ── Wellfound SEO pages (Option A — no auth, public pages) ───────────────────
+
+def fetch_wellfound_seo() -> list[dict]:
+    """
+    Scrape Wellfound's public SEO landing pages at
+    /role/l/<role-slug>/toronto. These pages are unauthenticated and embed
+    job data as Apollo GraphQL state in a <script id="__NEXT_DATA__"> tag.
+
+    Note: The Apollo state key structure can change when Wellfound updates
+    their frontend. If this returns 0 jobs, inspect the __NEXT_DATA__ JSON
+    at one of the URLs to find the current key paths.
+    """
+    log.info("Fetching Wellfound SEO pages...")
+    jobs = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    for role_slug in WELLFOUND_ROLES:
+        url = f"https://wellfound.com/role/l/{role_slug}/toronto"
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                log.warning(f"Wellfound SEO {role_slug}: HTTP {r.status_code}")
+                continue
+
+            match = re.search(
+                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                r.text,
+                re.DOTALL,
+            )
+            if not match:
+                log.warning(f"Wellfound SEO {role_slug}: no __NEXT_DATA__ found")
+                continue
+
+            data = json.loads(match.group(1))
+            apollo = (
+                data.get("props", {})
+                    .get("pageProps", {})
+                    .get("apolloState", {})
+            )
+
+            found_on_page = 0
+            for key, val in apollo.items():
+                if not isinstance(val, dict):
+                    continue
+                # Wellfound uses keys like "JobListing:12345" or "StartupRole:12345"
+                if not (key.startswith("JobListing:") or key.startswith("StartupRole:")):
+                    continue
+
+                title = val.get("title") or val.get("text") or ""
+                if not title:
+                    continue
+
+                # Company name may be a nested ref or inline string
+                startup = val.get("startup") or {}
+                if isinstance(startup, dict):
+                    company_name = startup.get("name", "")
+                else:
+                    # It's an Apollo ref like {"__ref": "Startup:123"} — look it up
+                    ref = startup.get("__ref", "")
+                    startup_obj = apollo.get(ref, {})
+                    company_name = startup_obj.get("name", "") if isinstance(startup_obj, dict) else ""
+
+                job_url = val.get("url") or val.get("applyUrl") or ""
+                if val.get("slug") and not job_url:
+                    job_url = f"https://wellfound.com/jobs/{val['slug']}"
+
+                jobs.append(safe_normalize({
+                    "title": title,
+                    "company": company_name,
+                    "location": "Toronto",
+                    "description": val.get("description") or val.get("descriptionSnippet") or "",
+                    "url": job_url,
+                }, "wellfound_seo"))
+                found_on_page += 1
+
+            log.info(f"Wellfound SEO {role_slug}: {found_on_page} jobs")
+            time.sleep(1.0)  # respectful crawl rate
+
+        except Exception as e:
+            log.warning(f"Wellfound SEO {role_slug} failed: {e}")
+
+    log.info(f"Wellfound SEO total: {len(jobs)} raw jobs")
+    return jobs
+
+
+# ── Remotive free API (Option B — startup-heavy remote jobs) ─────────────────
+
+def fetch_remotive() -> list[dict]:
+    """
+    Remotive is a startup-heavy remote job board with a free, open JSON API.
+    No auth, no scraping — plain GET requests. Jobs are remote-only so
+    location is always eligible; Claude's logistics score handles fit.
+    """
+    log.info("Fetching Remotive...")
+    jobs = []
+
+    for search_term in REMOTIVE_SEARCHES:
+        try:
+            r = requests.get(
+                "https://remotive.com/api/remote-jobs",
+                params={"search": search_term, "limit": 50},
+                timeout=15,
+            )
+            r.raise_for_status()
+            for item in r.json().get("jobs", []):
+                jobs.append(safe_normalize({
+                    "title": item.get("title", ""),
+                    "company": item.get("company_name", ""),
+                    "location": item.get("candidate_required_location") or "Remote",
+                    "description": item.get("description", ""),
+                    "url": item.get("url", ""),
+                    "salary_min": None,
+                    "salary_max": None,
+                }, "remotive"))
+        except Exception as e:
+            log.warning(f"Remotive '{search_term}' failed: {e}")
+        time.sleep(0.3)
+
+    log.info(f"Remotive: {len(jobs)} raw jobs")
+    return jobs
+
+
+# ── YC DISCOVERY ─────────────────────────────────────────────────────────────
 
 def fetch_yc_companies():
-    log.info("Fetching YC company directory...")
-    try:
-        r = requests.get("https://www.ycombinator.com/companies")
-        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text, re.DOTALL)
-        if match:
-            data = json.loads(match.group(1))
-            companies = data["props"]["pageProps"]["companies"]
-            return _filter_yc_companies(companies)
-    except Exception as e:
-        log.warning(f"YC fetch failed: {e}")
+    """
+    Fetch YC companies via Algolia. The __NEXT_DATA__ approach on
+    ycombinator.com/companies no longer works (infinite scroll SPA).
+    This queries the Algolia index directly with isHiring:true to avoid
+    probing dead companies, paginating through the full result set.
+    """
+    log.info("Fetching YC companies via Algolia...")
+    companies = []
+    page = 0
 
-    return _fetch_yc_algolia_fallback()
+    while True:
+        try:
+            r = requests.post(
+                "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries",
+                headers={
+                    "X-Algolia-Application-Id": "45BWZJ1SGC",
+                    # Public read-only key from YC's own frontend
+                    "X-Algolia-API-Key": "MjBjYjRiMzY0NzdhZWY0NjExY2NhZjYxMGIxYjc2MTAwNWFkNTkwNTc4NjgxYjU0",
+                    "Content-Type": "application/json",
+                },
+                json={"requests": [{
+                    "indexName": "YCCompany_production",
+                    "params": f"hitsPerPage=100&page={page}&filters=isHiring%3Atrue",
+                }]},
+                timeout=15,
+            )
+            r.raise_for_status()
+            hits = r.json()["results"][0]["hits"]
+            if not hits:
+                break
+            companies.extend(hits)
+            page += 1
+            if page > 60:  # safety ceiling (~6000 companies)
+                break
+            time.sleep(0.2)
+        except Exception as e:
+            log.warning(f"YC Algolia page {page} failed: {e}")
+            break
+
+    log.info(f"YC Algolia: {len(companies)} hiring companies fetched")
+    return _filter_yc_companies(companies)
 
 
 def _filter_yc_companies(raw):
@@ -427,35 +689,10 @@ def _filter_yc_companies(raw):
         tags = set([t.lower() for t in (co.get("tags") or [])])
         if not tags.intersection(YC_RELEVANT_TAGS):
             continue
-        if co.get("is_hiring") is False:
-            continue
         name = co.get("name", "")
         slug = co.get("slug") or re.sub(r"[^a-z0-9]+", "-", name.lower())
         results.append({"name": name, "slug": slug, "tags": list(tags)})
     return results
-
-
-def _fetch_yc_algolia_fallback():
-    companies = []
-    try:
-        r = requests.post(
-            "https://45bwzj1sgc-dsn.algolia.net/1/indexes/YCCompany_production/query",
-            headers={
-                "X-Algolia-Application-Id": "45BWZJ1SGC",
-                "X-Algolia-API-Key": "Zjk5ZmE5OGY4NjZlZWE4MGNiMWVhYzgyY2ZlOTdlOThhNGQ1NDMxMzE3ZmZkMzE=",
-            },
-            json={"query": "startup", "hitsPerPage": 50},
-        )
-        if r.status_code == 200:
-            for hit in r.json().get("hits", []):
-                companies.append({
-                    "name": hit.get("name"),
-                    "slug": hit.get("slug"),
-                    "tags": hit.get("tags", []),
-                })
-    except Exception:
-        pass
-    return companies
 
 
 def probe_company_all_ats(name, slug):
@@ -487,7 +724,7 @@ def fetch_yc_discovered(seen_yc):
     return all_jobs, seen_yc | new_slugs
 
 
-# ── OBJECTIVE FILTERING (ONLY CHANGE HERE) ───────────────────────────────────
+# ── OBJECTIVE FILTERING ───────────────────────────────────────────────────────
 
 def is_valid_job(job: dict) -> tuple[bool, str | None]:
     title = (job.get("title") or "").lower()
@@ -504,21 +741,24 @@ def is_valid_job(job: dict) -> tuple[bool, str | None]:
     if not ("sql" in text or "python" in text):
         return False, "no_sql_or_python"
 
-    # NEW: location filter
-    if not (
-        "canada" in location or
-        "toronto" in location or
-        "remote" in location
-    ):
-        return False, "location_filtered"
+    # Adzuna results get location-filtered; ATS/Wellfound/Remotive sources
+    # have already been scoped to Toronto/remote at query time, or are
+    # remote-only (Remotive), so we let Claude handle logistics scoring.
+    if job.get("source") == "adzuna":
+        if not (
+            "canada" in location or
+            "toronto" in location or
+            "remote" in location
+        ):
+            return False, "location_filtered"
 
     return True, None
 
 
-# ── CLAUDE EVAL (UNCHANGED) ─────────────────────────────────────────────────
+# ── CLAUDE EVAL ──────────────────────────────────────────────────────────────
 
 def evaluate_job(client, job):
-    log.info(f"Evaluating {job['title']}")
+    log.info(f"Evaluating {job['title']} @ {job['company']}")
 
     prompt = f"""
 Title: {job['title']}
@@ -543,9 +783,7 @@ Description:
         raise ValueError(f"No JSON found in Claude output: {text[:200]}")
 
     result = json.loads(match.group(0))
-
     bd = result.get("breakdown", {})
-
     overall = result.get("score")
 
     log.info(
@@ -561,7 +799,91 @@ Description:
 
     return result
 
-# ── MAIN (UNCHANGED STRUCTURE) ──────────────────────────────────────────────
+
+# ── EMAIL DIGEST ──────────────────────────────────────────────────────────────
+
+def send_digest(matches: list[dict]):
+    if not matches:
+        log.info("No matches above threshold — skipping email.")
+        return
+
+    date_str = datetime.today().strftime("%b %d, %Y")
+
+    html_rows = ""
+    for m in matches:
+        j = m["job"]
+        r = m["result"]
+        bd = r.get("breakdown", {})
+        highlights = "<br>".join(f"✓ {h}" for h in r.get("highlights", []))
+        flags = "<br>".join(f"⚠ {f}" for f in r.get("flags", []))
+        html_rows += f"""
+        <tr>
+          <td style="padding:10px;vertical-align:top">
+            <b>{j['title']}</b><br>
+            <span style="color:#555">{j['company']}</span><br>
+            <small style="color:#888">{j['location']} &nbsp;·&nbsp; {j['source']}</small>
+          </td>
+          <td style="padding:10px;text-align:center;vertical-align:top">
+            <span style="font-size:22px;font-weight:bold;color:#1a73e8">{r.get('score')}</span><br>
+            <small style="color:#888">/10</small>
+          </td>
+          <td style="padding:10px;vertical-align:top;font-size:12px;color:#444">
+            Career: {bd.get('career_work_quality')}&nbsp;
+            Co: {bd.get('company_interest')}&nbsp;
+            Impact: {bd.get('impact')}&nbsp;
+            Logistics: {bd.get('logistics')}
+          </td>
+          <td style="padding:10px;vertical-align:top;font-size:12px">
+            {r.get('reason', '')}
+          </td>
+          <td style="padding:10px;vertical-align:top;font-size:12px">
+            {highlights}
+          </td>
+          <td style="padding:10px;vertical-align:top;font-size:12px;color:#b00">
+            {flags}
+          </td>
+          <td style="padding:10px;vertical-align:top">
+            <a href="{j['url']}" style="background:#1a73e8;color:#fff;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px">Apply</a>
+          </td>
+        </tr>"""
+
+    html = f"""
+    <html>
+    <body style="font-family:sans-serif;font-size:13px;color:#222;background:#f9f9f9;padding:20px">
+      <h2 style="color:#1a73e8">Job Scout — {date_str}</h2>
+      <p style="color:#555">{len(matches)} role{"s" if len(matches) != 1 else ""} scored {SCORE_THRESHOLD}+ today</p>
+      <table border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;background:#fff;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+        <tr style="background:#f0f4ff;font-size:11px;text-transform:uppercase;color:#888;font-weight:bold">
+          <th style="padding:10px;text-align:left">Role</th>
+          <th style="padding:10px">Score</th>
+          <th style="padding:10px;text-align:left">Breakdown</th>
+          <th style="padding:10px;text-align:left">Reason</th>
+          <th style="padding:10px;text-align:left">Highlights</th>
+          <th style="padding:10px;text-align:left">Flags</th>
+          <th style="padding:10px;text-align:left">Link</th>
+        </tr>
+        {html_rows}
+      </table>
+      <p style="color:#aaa;font-size:11px;margin-top:20px">Job Scout · {date_str}</p>
+    </body>
+    </html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Job Scout: {len(matches)} match{'es' if len(matches) != 1 else ''} — {date_str}"
+    msg["From"]    = GMAIL_SENDER
+    msg["To"]      = GMAIL_RECIPIENT
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+            smtp.sendmail(GMAIL_SENDER, GMAIL_RECIPIENT, msg.as_string())
+        log.info(f"Digest sent to {GMAIL_RECIPIENT}: {len(matches)} matches.")
+    except Exception as e:
+        log.error(f"Failed to send digest email: {e}")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("Starting Job Scout...")
@@ -575,22 +897,57 @@ def main():
     jobs += fetch_ats_batch("lever", LEVER_COMPANIES, fetch_lever)
     jobs += fetch_ats_batch("workable", WORKABLE_COMPANIES, fetch_workable)
     jobs += fetch_ats_batch("ashby", ASHBY_COMPANIES, fetch_ashby)
+    jobs += fetch_mars_jobs()
+    jobs += fetch_wellfound_seo()
+    jobs += fetch_remotive()
 
     yc_jobs, seen_yc = fetch_yc_discovered(seen_yc)
     jobs += yc_jobs
 
-    filtered = []
+    # Deduplicate against seen jobs
+    new_jobs = []
     for j in jobs:
-        ok, _ = is_valid_job(j)
+        jid = job_id(j)
+        if jid not in seen_jobs:
+            new_jobs.append(j)
+            seen_jobs.add(jid)
+
+    log.info(f"Total raw: {len(jobs)} | New (unseen): {len(new_jobs)}")
+
+    # Objective filter
+    filtered = []
+    filter_counts: dict[str, int] = {}
+    for j in new_jobs:
+        ok, reason = is_valid_job(j)
         if ok:
             filtered.append(j)
+        else:
+            filter_counts[reason] = filter_counts.get(reason, 0) + 1
 
-    log.info(f"Filtered jobs: {len(filtered)}")
+    log.info(f"Post-filter: {len(filtered)} jobs | Dropped: {filter_counts}")
 
+    # Claude evaluation
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    strong_matches = []
 
     for j in filtered[:20]:
-        evaluate_job(client, j)
+        try:
+            result = evaluate_job(client, j)
+            if result.get("score", 0) >= SCORE_THRESHOLD:
+                strong_matches.append({"job": j, "result": result})
+        except Exception as e:
+            log.warning(f"Evaluation failed for {j.get('title')}: {e}")
+
+    log.info(f"Strong matches (score >= {SCORE_THRESHOLD}): {len(strong_matches)}")
+
+    # Send digest
+    send_digest(strong_matches)
+
+    # Persist seen state
+    save_set(SEEN_JOBS_FILE, seen_jobs)
+    save_set(SEEN_YC_SLUGS_FILE, seen_yc)
+
+    log.info("Job Scout complete.")
 
 
 if __name__ == "__main__":
