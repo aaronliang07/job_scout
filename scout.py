@@ -72,32 +72,142 @@ YC_RELEVANT_TAGS = {
 # ── Master company list ───────────────────────────────────────────────────────
 
 ALL_COMPANIES = list(dict.fromkeys([
-    # Gaming & entertainment
-    "riotgames", "epicgames", "scopely", "niantic", "kabam", "naughtydog",
-    "moonactive",
-    # Consumer / human-centered
-    "duolingo", "headspace", "calm", "strava", "peloton",
-    "bumble", "eventbrite", "etsy", "patreon", "khanacademy",
-    "coursera", "figma", "discord", "reddit", "pinterest",
-    # Health & fitness
-    "whoop", "oura",
-    # Canadian / Toronto
-    "wealthsimple", "hootsuite", "lightspeed", "d2l",
-    "koho", "wattpad", "achievers", "ada-support", "benchsci", "sonder",
-    "properly",
-    # Marketplace / commerce
-    "faire", "instacart", "lyft", "airbnb",
-    # Music / media
-    "spotify", "netflix", "wmg",
-    # Product / analytics tools
-    "airtable", "mixpanel", "amplitude", "typeform", "notion", "linear",
-    # Fintech
-    "robinhood", "ramp", "remote",
-    # Dev tools / infra
-    "replit", "cursor", "vanta", "watershed", "cohere", "perplexity",
-    "databricks", "cloudflare", "stripe",
-    # Other
-    "belong", "dayoneapp",
+
+    # ── Gaming & Entertainment ──────────────────────────────────────────────
+    "riotgames",          # Greenhouse ✓
+    "epicgames",          # Greenhouse ✓
+    "scopely",            # Greenhouse ✓
+    "niantic",            # Greenhouse ✓
+    "naughtydog",         # Greenhouse ✓
+    "2k",                 # Greenhouse ✓
+    "taketwo",            # Greenhouse ✓
+    "zynga",              # Greenhouse
+    "jam-city",           # Greenhouse (probe — may also try "jamcity")
+    "playtika",           # Greenhouse
+    "socialpoint",        # Greenhouse
+    "rovio",              # Greenhouse
+    "sonyinteractiveentertainmentglobal",  # Greenhouse ✓
+    "sonymusic",          # Greenhouse ✓
+    "sonymusicentertainment",              # Greenhouse ✓
+    "kabam",              # Lever ✓
+    "wmg",                # Lever ✓
+
+    # ── Consumer / Human-Centered ──────────────────────────────────────────
+    "duolingo",           # Greenhouse ✓
+    "headspace",          # Greenhouse ✓
+    "calm",               # Greenhouse ✓
+    "strava",             # Greenhouse ✓
+    "peloton",            # Greenhouse ✓
+    "bumble",             # Greenhouse ✓
+    "eventbrite",         # Greenhouse ✓
+    "etsy",               # Greenhouse ✓
+    "patreon",            # Greenhouse ✓
+    "khanacademy",        # Greenhouse ✓
+    "coursera",           # Greenhouse ✓
+    "discord",            # Greenhouse ✓
+    "reddit",             # Greenhouse ✓
+    "pinterest",          # Greenhouse ✓
+    "zwift",              # Greenhouse ✓
+    "noomgrowth",         # Greenhouse ✓ (slug is noomgrowth, not noom)
+    "nextdoor",           # Greenhouse ✓
+    "depop",              # Greenhouse ✓
+    "whatnot",            # Greenhouse ✓
+    "poshmark",           # Greenhouse ✓
+    "goatgroup",          # Greenhouse ✓ (slug is goatgroup, not goat)
+    "stockx",             # Greenhouse ✓
+    "doordashusa",        # Greenhouse ✓ (slug is doordashusa, not doordash)
+    "hinge",              # Lever ✓ (via matchgroup parent; probe both)
+    "matchgroup",         # Lever ✓ (covers Hinge, Tinder, Match)
+    "alltrails",          # Lever ✓
+    "figma",              # Lever ✓
+
+    # ── Health & Wearables ────────────────────────────────────────────────
+    "whoop",              # Greenhouse ✓
+    "oura",               # Greenhouse ✓
+    "hinge-health",       # Ashby ✓ (digital MSK health — different from Hinge dating)
+
+    # ── Media & Journalism ───────────────────────────────────────────────
+    "thenewyorktimes",    # Greenhouse ✓ (covers The Athletic, Wirecutter, Games)
+    "voxmedia",           # Greenhouse ✓
+    "toogoodtogo",        # Greenhouse ✓
+    "iheartmedia",        # Greenhouse
+    "soundcloud",         # Greenhouse
+    "spotify",            # Greenhouse ✓
+    "netflix",            # Greenhouse ✓
+
+    # ── Sports (non-gambling) ────────────────────────────────────────────
+    "nflcareers",         # Greenhouse ✓
+    "fanatics",           # Greenhouse
+
+    # ── Canadian / Toronto ──────────────────────────────────────────────
+    "wealthsimple",       # Greenhouse ✓
+    "hootsuite",          # Greenhouse ✓
+    "lightspeed",         # Greenhouse ✓
+    "d2l",                # Greenhouse ✓
+    "koho",               # Greenhouse ✓
+    "wattpad",            # Greenhouse ✓
+    "achievers",          # Greenhouse ✓
+    "ada-support",        # probe
+    "benchsci",           # probe
+    "sonder",             # probe
+    "properly",           # probe
+    "financeit",          # Greenhouse
+    "tulip",              # Greenhouse
+    "vendasta",           # Greenhouse
+    "biorender",          # Lever
+    "createmusicgroup",   # Rippling ✓
+
+    # ── Marketplace / Commerce ───────────────────────────────────────────
+    "faire",              # Greenhouse ✓
+    "instacart",          # Greenhouse ✓
+    "lyft",               # Greenhouse ✓
+    "airbnb",             # Greenhouse ✓
+
+    # ── Product / Analytics Tools ─────────────────────────────────────────
+    "airtable",           # Greenhouse ✓
+    "mixpanel",           # Greenhouse ✓
+    "amplitude",          # Greenhouse ✓
+    "typeform",           # Greenhouse ✓
+    "notion",             # Ashby ✓
+    "linear",             # Ashby ✓
+    "posthog",            # Ashby ✓
+    "heap",               # Greenhouse
+    "fullstory",          # Greenhouse
+    "braze",              # Greenhouse
+    "klaviyo",            # Greenhouse
+    "contentful",         # Greenhouse
+
+    # ── Fintech ──────────────────────────────────────────────────────────
+    "robinhood",          # Greenhouse ✓
+    "ramp",               # Ashby ✓
+    "remote",             # Greenhouse ✓
+    "chime",              # Greenhouse ✓
+    "transferwise",       # Greenhouse ✓ (Wise's slug)
+    "plaid",              # Lever ✓
+    "marqeta",            # Greenhouse ✓
+    "brex",               # Greenhouse ✓
+
+    # ── Dev Tools / Infra ────────────────────────────────────────────────
+    "replit",             # Greenhouse ✓
+    "cursor",             # Ashby ✓
+    "vanta",              # Greenhouse ✓
+    "watershed",          # Greenhouse ✓
+    "cohere",             # Greenhouse ✓
+    "perplexity",         # Ashby ✓
+    "databricks",         # Greenhouse ✓
+    "cloudflare",         # Greenhouse ✓
+    "stripe",             # Greenhouse ✓
+    "vercel",             # Ashby ✓
+    "supabase",           # Ashby ✓
+    "dbt-labs",           # probe (may be "dbtlabs")
+    "fivetran",           # Greenhouse
+    "datadog",            # Greenhouse ✓
+    "sentry",             # Ashby ✓
+
+    # ── Other ────────────────────────────────────────────────────────────
+    "belong",             # probe
+    "dayoneapp",          # probe
+
 ]))
 
 # ── Remotive search terms ─────────────────────────────────────────────────────
