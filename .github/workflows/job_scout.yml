@@ -2,7 +2,7 @@ name: Job Scout
 
 on:
   schedule:
-    - cron: "0 16 * * 1-5"  # midnight Toronto time
+    - cron: "0 16 * * 1-5"  # noon Toronto time
   workflow_dispatch:          # lets you trigger it manually from the Actions tab
 
 jobs:
