@@ -18,7 +18,7 @@ import re
 import smtplib
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -38,8 +38,26 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 
 SCORE_THRESHOLD = 8
 
+# Drop jobs older than this many days (only applied when a date is available)
+MAX_JOB_AGE_DAYS = 3
+
 SEEN_JOBS_FILE     = Path("data/seen_jobs.json")
 SEEN_YC_SLUGS_FILE = Path("data/seen_yc_slugs.json")
+
+# ── Agency / staffing blocklist ───────────────────────────────────────────────
+# If any of these substrings appear in the company name (case-insensitive),
+# the job is dropped before Claude evaluation. Add to this list as you spot
+# recurring noise in the logs.
+
+AGENCY_KEYWORDS = {
+    "staffing", "recruiting", "recruitment", "talent to hire", "hr solutions",
+    "hr consulting", "nearsource", "nexgen", "mindscope", "manpower",
+    "randstad", "robert half", "hays ", "adecco", "kelly services",
+    "insight global", "modis", "experis", "kforce", "teksystems",
+    "apex group", "apex systems", "beamstaff", "procom", "compucom",
+    "solutions inc", "tech solutions", "consultants inc", "consulting inc",
+    "it solutions", "it staffing",
+}
 
 # ── YC category tags we care about ───────────────────────────────────────────
 
@@ -52,9 +70,6 @@ YC_RELEVANT_TAGS = {
 }
 
 # ── Master company list ───────────────────────────────────────────────────────
-# All companies are probed against every ATS platform (Greenhouse, Lever,
-# Workable, Ashby, Rippling). No need to guess which platform each uses —
-# failed probes are fast 404s and the overhead is negligible with parallelism.
 
 ALL_COMPANIES = list(dict.fromkeys([
     # Gaming & entertainment
@@ -261,18 +276,46 @@ def job_id(job: dict) -> str:
     raw = job.get("url") or f"{job.get('title','')}|{job.get('company','')}"
     return hashlib.md5(raw.encode()).hexdigest()
 
+# ── Date parsing helper ───────────────────────────────────────────────────────
+
+def parse_posted_at(value) -> datetime | None:
+    """
+    Attempt to parse a posted_at value into an aware UTC datetime.
+    Handles:
+      - None / missing → returns None (job passes date filter)
+      - ISO 8601 strings (e.g. "2024-06-01T12:00:00Z")
+      - Unix timestamps in seconds (int/float)
+      - Unix timestamps in milliseconds (Lever uses ms)
+    Returns None on any parse failure so the job still passes through.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            # Lever gives milliseconds; anything > 1e10 is almost certainly ms
+            ts = value / 1000 if value > 1e10 else value
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        if isinstance(value, str):
+            # Strip trailing Z for Python < 3.11 compatibility
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
 # ── ATS normalization ─────────────────────────────────────────────────────────
 
 def safe_normalize(raw: dict, source: str) -> dict:
     return {
-        "title": raw.get("title") or "Unknown Title",
-        "company": raw.get("company") or source,
-        "location": raw.get("location") or "Unknown",
-        "description": (raw.get("description") or "")[:3000],
-        "url": raw.get("url") or "",
-        "source": source,
+        "title":      raw.get("title") or "Unknown Title",
+        "company":    raw.get("company") or source,
+        "location":   raw.get("location") or "Unknown",
+        "description":(raw.get("description") or "")[:3000],
+        "url":        raw.get("url") or "",
+        "source":     source,
         "salary_min": raw.get("salary_min"),
         "salary_max": raw.get("salary_max"),
+        # posted_at is stored as raw value; parse_posted_at() converts it at filter time
+        "posted_at":  raw.get("posted_at"),
     }
 
 # ── Stage 1: Ingestion ────────────────────────────────────────────────────────
@@ -287,7 +330,7 @@ def fetch_adzuna() -> list[dict]:
         "strategy analyst", "operations analyst", "revenue operations analyst",
         "product operations", "product manager", "growth product manager",
         "experiment analyst", "A/B testing analyst", "customer analytics",
-        "marketing analytics", "data analyst",
+        "marketing analytics",
     ]
     base = "https://api.adzuna.com/v1/api/jobs/ca/search/1"
     for q in queries:
@@ -302,13 +345,14 @@ def fetch_adzuna() -> list[dict]:
             r.raise_for_status()
             for item in r.json().get("results", []):
                 jobs.append(safe_normalize({
-                    "title": item.get("title", ""),
-                    "company": item.get("company", {}).get("display_name", ""),
-                    "location": item.get("location", {}).get("display_name", ""),
-                    "description": item.get("description", ""),
-                    "url": item.get("redirect_url", ""),
+                    "title":      item.get("title", ""),
+                    "company":    item.get("company", {}).get("display_name", ""),
+                    "location":   item.get("location", {}).get("display_name", ""),
+                    "description":item.get("description", ""),
+                    "url":        item.get("redirect_url", ""),
                     "salary_min": item.get("salary_min"),
                     "salary_max": item.get("salary_max"),
+                    "posted_at":  item.get("created"),       # ISO string from Adzuna
                 }, "adzuna"))
         except Exception as e:
             log.warning(f"Adzuna query '{q}' failed: {e}")
@@ -329,11 +373,12 @@ def fetch_greenhouse(slug: str) -> list[dict]:
         jobs = []
         for item in r.json().get("jobs", []):
             jobs.append(safe_normalize({
-                "title": item.get("title", ""),
-                "company": slug,
-                "location": " | ".join(o.get("name", "") for o in item.get("offices", [])),
-                "description": item.get("content", ""),
-                "url": item.get("absolute_url", ""),
+                "title":      item.get("title", ""),
+                "company":    slug,
+                "location":   " | ".join(o.get("name", "") for o in item.get("offices", [])),
+                "description":item.get("content", ""),
+                "url":        item.get("absolute_url", ""),
+                "posted_at":  item.get("updated_at"),        # ISO string
             }, f"greenhouse/{slug}"))
         return jobs
     except Exception:
@@ -352,11 +397,12 @@ def fetch_lever(slug: str) -> list[dict]:
         jobs = []
         for item in r.json():
             jobs.append(safe_normalize({
-                "title": item.get("text", ""),
-                "company": slug,
-                "location": item.get("categories", {}).get("location", ""),
-                "description": item.get("descriptionPlain", ""),
-                "url": item.get("hostedUrl", ""),
+                "title":      item.get("text", ""),
+                "company":    slug,
+                "location":   item.get("categories", {}).get("location", ""),
+                "description":item.get("descriptionPlain", ""),
+                "url":        item.get("hostedUrl", ""),
+                "posted_at":  item.get("createdAt"),         # Unix ms timestamp
             }, f"lever/{slug}"))
         return jobs
     except Exception:
@@ -376,11 +422,12 @@ def fetch_workable(slug: str) -> list[dict]:
         jobs = []
         for item in r.json().get("results", []):
             jobs.append(safe_normalize({
-                "title": item.get("title", ""),
-                "company": slug,
-                "location": item.get("city", "") or "Remote",
-                "description": item.get("description", ""),
-                "url": f"https://apply.workable.com/{slug}/j/{item.get('shortcode','')}",
+                "title":      item.get("title", ""),
+                "company":    slug,
+                "location":   item.get("city", "") or "Remote",
+                "description":item.get("description", ""),
+                "url":        f"https://apply.workable.com/{slug}/j/{item.get('shortcode','')}",
+                "posted_at":  item.get("created_at"),        # ISO string
             }, f"workable/{slug}"))
         return jobs
     except Exception:
@@ -403,11 +450,12 @@ def fetch_ashby(slug: str) -> list[dict]:
             if item.get("isRemote"):
                 location = f"Remote ({location})" if location else "Remote"
             jobs.append(safe_normalize({
-                "title": item.get("title", ""),
-                "company": slug,
-                "location": location,
-                "description": item.get("descriptionPlain", "") or item.get("descriptionHtml", ""),
-                "url": item.get("jobUrl", ""),
+                "title":      item.get("title", ""),
+                "company":    slug,
+                "location":   location,
+                "description":item.get("descriptionPlain", "") or item.get("descriptionHtml", ""),
+                "url":        item.get("jobUrl", ""),
+                "posted_at":  item.get("publishedAt"),       # ISO string
             }, f"ashby/{slug}"))
         return jobs
     except Exception:
@@ -415,11 +463,6 @@ def fetch_ashby(slug: str) -> list[dict]:
 
 
 def fetch_rippling(slug: str) -> list[dict]:
-    """
-    Rippling public ATS board endpoint — no auth required.
-    URL pattern: https://api.rippling.com/platform/api/ats/v1/board/{slug}/jobs
-    The job detail URL is https://ats.rippling.com/{slug}/jobs/{uuid}
-    """
     try:
         r = requests.get(
             f"https://api.rippling.com/platform/api/ats/v1/board/{slug}/jobs",
@@ -432,38 +475,35 @@ def fetch_rippling(slug: str) -> list[dict]:
         for item in r.json():
             uuid = item.get("uuid", "")
             jobs.append(safe_normalize({
-                "title": item.get("name", ""),
-                "company": slug,
-                "location": item.get("workLocation", {}).get("label", "") or "Unknown",
-                "description": item.get("description", ""),
-                "url": f"https://ats.rippling.com/{slug}/jobs/{uuid}" if uuid else "",
+                "title":      item.get("name", ""),
+                "company":    slug,
+                "location":   item.get("workLocation", {}).get("label", "") or "Unknown",
+                "description":item.get("description", ""),
+                "url":        f"https://ats.rippling.com/{slug}/jobs/{uuid}" if uuid else "",
+                "posted_at":  None,                          # not available in public endpoint
             }, f"rippling/{slug}"))
         return jobs
     except Exception:
         return []
 
 
-# All ATS probe functions in priority order
 ATS_FETCHERS = [fetch_greenhouse, fetch_lever, fetch_workable, fetch_ashby, fetch_rippling]
 
 
 def probe_company(slug: str) -> list[dict]:
-    """Try every ATS platform for a company slug and return all jobs found."""
     clean = re.sub(r"[^a-z0-9]+", "-", slug.lower())
-    variants = list(dict.fromkeys([slug, clean]))  # deduplicate while preserving order
-
+    variants = list(dict.fromkeys([slug, clean]))
     all_jobs = []
     for fn in ATS_FETCHERS:
         for v in variants:
             jobs = fn(v)
             if jobs:
                 all_jobs.extend(jobs)
-                break  # found this platform, move to next ATS
+                break
     return all_jobs
 
 
 def fetch_all_companies_parallel(slugs: list[str], workers: int = 10) -> list[dict]:
-    """Probe all companies in parallel, with a per-company timeout guard."""
     all_jobs: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(probe_company, slug): slug for slug in slugs}
@@ -486,7 +526,6 @@ def fetch_all_companies_parallel(slugs: list[str], workers: int = 10) -> list[di
 def fetch_remotive() -> list[dict]:
     log.info("Fetching Remotive...")
     jobs = []
-
     for search_term in REMOTIVE_SEARCHES:
         try:
             r = requests.get(
@@ -497,23 +536,21 @@ def fetch_remotive() -> list[dict]:
             r.raise_for_status()
             for item in r.json().get("jobs", []):
                 jobs.append(safe_normalize({
-                    "title": item.get("title", ""),
-                    "company": item.get("company_name", ""),
-                    "location": item.get("candidate_required_location") or "Remote",
-                    "description": item.get("description", ""),
-                    "url": item.get("url", ""),
-                    "salary_min": None,
-                    "salary_max": None,
+                    "title":      item.get("title", ""),
+                    "company":    item.get("company_name", ""),
+                    "location":   item.get("candidate_required_location") or "Remote",
+                    "description":item.get("description", ""),
+                    "url":        item.get("url", ""),
+                    "posted_at":  item.get("publication_date"),  # ISO string
                 }, "remotive"))
         except Exception as e:
             log.warning(f"Remotive '{search_term}' failed: {e}")
         time.sleep(0.3)
-
     log.info(f"Remotive: {len(jobs)} raw jobs")
     return jobs
 
 
-# ── YC DISCOVERY (via yc-oss/api static mirror) ───────────────────────────────
+# ── YC DISCOVERY ─────────────────────────────────────────────────────────────
 
 _YC_OSS_BASE = "https://raw.githubusercontent.com/yc-oss/api/main/companies"
 
@@ -549,7 +586,6 @@ _YC_TAG_SLUGS = {
 
 def fetch_yc_companies() -> list[dict]:
     log.info("Fetching YC companies via yc-oss/api mirror...")
-
     seen_slugs: set[str] = set()
     companies: list[dict] = []
     headers = {"Accept": "application/json"}
@@ -569,11 +605,7 @@ def fetch_yc_companies() -> list[dict]:
                 if slug in seen_slugs:
                     continue
                 seen_slugs.add(slug)
-                companies.append({
-                    "name": co.get("name", ""),
-                    "slug": slug,
-                    "tags": co.get("tags") or [tag],
-                })
+                companies.append({"name": co.get("name", ""), "slug": slug, "tags": co.get("tags") or [tag]})
         except Exception as e:
             log.warning(f"YC tag '{tag_slug}' fetch failed: {e}")
 
@@ -590,11 +622,7 @@ def fetch_yc_companies() -> list[dict]:
                 if slug in seen_slugs:
                     continue
                 seen_slugs.add(slug)
-                companies.append({
-                    "name": co.get("name", ""),
-                    "slug": slug,
-                    "tags": list(co_tags),
-                })
+                companies.append({"name": co.get("name", ""), "slug": slug, "tags": list(co_tags)})
         except Exception as e:
             log.warning(f"YC hiring.json fallback failed: {e}")
 
@@ -602,7 +630,6 @@ def fetch_yc_companies() -> list[dict]:
     return companies
 
 
-# Maximum new YC companies to probe per run; seen_yc grows each day
 _YC_PROBE_CAP = 75
 
 
@@ -626,11 +653,18 @@ def fetch_yc_discovered(seen_yc: set) -> tuple[list[dict], set]:
 
 # ── OBJECTIVE FILTERING ───────────────────────────────────────────────────────
 
+def is_agency(company: str) -> bool:
+    """Return True if the company name matches any staffing/agency keyword."""
+    name = company.lower()
+    return any(kw in name for kw in AGENCY_KEYWORDS)
+
+
 def is_valid_job(job: dict) -> tuple[bool, str | None]:
     title    = (job.get("title") or "").lower()
     desc     = (job.get("description") or "").lower()
     text     = f"{title} {desc}"
     location = (job.get("location") or "").lower()
+    company  = job.get("company") or ""
 
     if not job.get("title") or not job.get("url"):
         return False, "missing_title_or_url"
@@ -641,8 +675,16 @@ def is_valid_job(job: dict) -> tuple[bool, str | None]:
     if "sql" not in text:
         return False, "no_sql"
 
-    # Adzuna results get location-filtered; all ATS sources are already scoped
-    # to specific companies or remote-only (Remotive), so Claude handles logistics.
+    if is_agency(company):
+        return False, "agency"
+
+    # Date filter — only applied when a parseable date is present
+    posted_at = parse_posted_at(job.get("posted_at"))
+    if posted_at is not None:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=MAX_JOB_AGE_DAYS)
+        if posted_at < cutoff:
+            return False, "too_old"
+
     if job.get("source") == "adzuna":
         if not ("canada" in location or "toronto" in location or "remote" in location):
             return False, "location_filtered"
@@ -774,17 +816,13 @@ def main():
 
     jobs: list[dict] = []
 
-    # Adzuna: Toronto keyword search
     jobs += fetch_adzuna()
 
-    # Master company list: probe all ATS platforms in parallel
     log.info(f"Probing {len(ALL_COMPANIES)} companies across all ATS platforms...")
     jobs += fetch_all_companies_parallel(ALL_COMPANIES)
 
-    # Remotive: remote-only startup jobs
     jobs += fetch_remotive()
 
-    # YC discovery: new hiring companies from the yc-oss mirror
     yc_jobs, seen_yc = fetch_yc_discovered(seen_yc)
     jobs += yc_jobs
 
@@ -810,11 +848,27 @@ def main():
 
     log.info(f"Post-filter: {len(filtered)} jobs | Dropped: {filter_counts}")
 
-    # Claude evaluation
+    # Sort: named ATS companies first, then remotive, then adzuna noise last
+    SOURCE_PRIORITY = {
+        "greenhouse": 0, "lever": 0, "workable": 0, "ashby": 0, "rippling": 0,
+        "remotive": 1,
+        "adzuna": 2,
+    }
+
+    def source_rank(job):
+        src = job.get("source", "")
+        for key, rank in SOURCE_PRIORITY.items():
+            if src.startswith(key):
+                return rank
+        return 1
+
+    filtered.sort(key=source_rank)
+
+    # Claude evaluation — no arbitrary cap, ATS jobs always evaluated first
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     strong_matches: list[dict] = []
 
-    for j in filtered[:20]:
+    for j in filtered:
         try:
             result = evaluate_job(client, j)
             if result.get("score", 0) >= SCORE_THRESHOLD:
