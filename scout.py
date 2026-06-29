@@ -801,6 +801,7 @@ def is_valid_job(job: dict) -> tuple[bool, str | None]:
     location_text = f"{location} {desc}"
     GEO_TERMS = ("canada", "toronto", "ontario", "north america", "remote")
     if not any(term in location_text for term in GEO_TERMS):
+        log.info(f"LOCATION_CHECK | {job.get('title')} @ {job.get('company')} | loc='{location}' | geo_hit={any(t in location_text for t in GEO_TERMS)}")
         return False, "location_filtered"
 
     return True, None
