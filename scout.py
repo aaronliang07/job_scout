@@ -795,12 +795,15 @@ def is_valid_job(job: dict) -> tuple[bool, str | None]:
         if posted_at < cutoff:
             return False, "too_old"
 
-    if job.get("source") == "adzuna":
-        if not ("canada" in location or "toronto" in location or "remote" in location):
-            return False, "location_filtered"
+    # Location filter — applied to all sources
+    # Check both location field and description since ATS jobs often embed
+    # location eligibility in the job body ("open to candidates in Canada", etc.)
+    location_text = f"{location} {desc}"
+    GEO_TERMS = ("canada", "toronto", "ontario", "north america", "remote")
+    if not any(term in location_text for term in GEO_TERMS):
+        return False, "location_filtered"
 
     return True, None
-
 
 # ── CLAUDE EVAL ──────────────────────────────────────────────────────────────
 
