@@ -36,7 +36,7 @@ jobs:
           GMAIL_SENDER:       ${{ secrets.GMAIL_SENDER }}
           GMAIL_RECIPIENT:    ${{ secrets.GMAIL_RECIPIENT }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-        run: python job_scout.py
+        run: python scout.py
 
       - name: Save seen-jobs cache
         if: always()   # persist even if the run partially fails
