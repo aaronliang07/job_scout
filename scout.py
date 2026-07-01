@@ -250,12 +250,13 @@ High (9–10):
 - Strategy & Ops / BizOps (ONLY if SQL + real analytical ownership)
 - Marketplace / user behavior analytics
 - Pricing / revenue analytics (decision-driven)
+- Product manager roles
+- Operational analytics
 
 Medium (5–8):
 - Business Intelligence (mixed analysis + reporting)
 - Marketing / Customer Analytics
-- Operational analytics
-- General Data Analyst roles
+- General Data Analyst roles not meeting any criteria in the High section
 
 Low (0–4):
 - Reporting-only roles
