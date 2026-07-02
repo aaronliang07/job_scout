@@ -29,8 +29,8 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-ADZUNA_APP_ID      = os.environ["ADZUNA_APP_ID"]
-ADZUNA_APP_KEY     = os.environ["ADZUNA_APP_KEY"]
+ADZUNA_APP_ID      = os.environ["ADZUNA_APP_ID"].strip()
+ADZUNA_APP_KEY     = os.environ["ADZUNA_APP_KEY"].strip()
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 GMAIL_SENDER       = os.environ["GMAIL_SENDER"]
 GMAIL_RECIPIENT    = os.environ["GMAIL_RECIPIENT"]
