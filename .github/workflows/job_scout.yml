@@ -1,33 +1,35 @@
 name: Job Scout
-
 on:
   schedule:
     - cron: "0 16 * * 1-5"  # noon Toronto time
   workflow_dispatch:          # lets you trigger it manually from the Actions tab
-
 jobs:
   scout:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install anthropic requests
-
       - name: Restore seen-jobs cache
         uses: actions/cache/restore@v4
         with:
           path: data/
-          # Restore from the most recent run via prefix match; exact key won't
-          # exist yet so restore-keys does the work here.
           key: seen-jobs-${{ runner.os }}-${{ github.run_id }}
           restore-keys: seen-jobs-${{ runner.os }}-
-
+      - name: Check secrets
+        run: |
+          echo "ADZUNA_APP_ID length: ${#ADZUNA_APP_ID}"
+          echo "ADZUNA_APP_KEY length: ${#ADZUNA_APP_KEY}"
+          echo "ANTHROPIC_API_KEY length: ${#ANTHROPIC_API_KEY}"
+          echo "GMAIL_APP_PASSWORD length: ${#GMAIL_APP_PASSWORD}"
+        env:
+          ADZUNA_APP_ID:      ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY:     ${{ secrets.ADZUNA_APP_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       - name: Run Job Scout
         env:
           ADZUNA_APP_ID:      ${{ secrets.ADZUNA_APP_ID }}
@@ -37,12 +39,9 @@ jobs:
           GMAIL_RECIPIENT:    ${{ secrets.GMAIL_RECIPIENT }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python scout.py
-
       - name: Save seen-jobs cache
-        if: always()   # persist even if the run partially fails
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: data/
-          # Unique key per run — GitHub caches are immutable once written,
-          # so we need a new key each time to actually save updated state.
           key: seen-jobs-${{ runner.os }}-${{ github.run_id }}
