@@ -467,6 +467,7 @@ def fetch_adzuna() -> list[dict]:
                 }, "adzuna"))
         except Exception as e:
             log.warning(f"Adzuna query '{q}' failed: {e}")
+    log.info(f"Adzuna: {len(jobs)} raw jobs fetched")
     return jobs
 
 
