@@ -42,7 +42,6 @@ SCORE_THRESHOLD = 8
 MAX_JOB_AGE_DAYS = 3
 
 SEEN_JOBS_FILE     = Path("data/seen_jobs.json")
-SEEN_YC_SLUGS_FILE = Path("data/seen_yc_slugs.json")
 
 # ── Agency / staffing blocklist ───────────────────────────────────────────────
 # If any of these substrings appear in the company name (case-insensitive),
@@ -661,7 +660,85 @@ def fetch_remotive() -> list[dict]:
     log.info(f"Remotive: {len(jobs)} raw jobs")
     return jobs
 
+# ── Himalayas free API ────────────────────────────────────────────────────────
 
+HIMALAYAS_SEARCHES = [
+   "data analyst", "product analyst", "product analytics",
+        "analytics engineer", "data scientist product", "growth analyst",
+        "business analyst", "business operations analyst", "bizops analyst",
+        "strategy analyst", "operations analyst", "revenue operations analyst",
+        "product operations", "product manager", "growth product manager",
+        "experiment analyst", "A/B testing analyst", "customer analytics",
+        "marketing analytics",
+]
+
+def fetch_himalayas() -> list[dict]:
+    log.info("Fetching Himalayas...")
+    jobs = []
+    for search_term in HIMALAYAS_SEARCHES:
+        try:
+            r = requests.get(
+                "https://himalayas.app/jobs/api/search",
+                params={"q": search_term, "page": 1},
+                timeout=15,
+            )
+            r.raise_for_status()
+            for item in r.json().get("jobs", []):
+                jobs.append(safe_normalize({
+                    "title":      item.get("title", ""),
+                    "company":    item.get("companyName", ""),
+                    "location":   ", ".join(item.get("locationRestrictions") or []) or "Remote",
+                    "description":item.get("description", ""),
+                    "url":        item.get("applicationLink") or item.get("url", ""),
+                    "posted_at":  item.get("createdAt"),
+                }, "himalayas"))
+        except Exception as e:
+            log.warning(f"Himalayas '{search_term}' failed: {e}")
+        time.sleep(0.3)
+    log.info(f"Himalayas: {len(jobs)} raw jobs")
+    return jobs
+
+
+# ── Jobicy free API ───────────────────────────────────────────────────────────
+
+JOBICY_SEARCHES = [
+    "data analyst", "product analyst", "product analytics",
+        "analytics engineer", "data scientist product", "growth analyst",
+        "business analyst", "business operations analyst", "bizops analyst",
+        "strategy analyst", "operations analyst", "revenue operations analyst",
+        "product operations", "product manager", "growth product manager",
+        "experiment analyst", "A/B testing analyst", "customer analytics",
+        "marketing analytics",
+]
+
+def fetch_jobicy() -> list[dict]:
+    log.info("Fetching Jobicy...")
+    jobs = []
+    for search_term in JOBICY_SEARCHES:
+        try:
+            r = requests.get(
+                "https://jobicy.com/api/v2/remote-jobs",
+                params={"tag": search_term, "count": 50},
+                timeout=15,
+            )
+            r.raise_for_status()
+            for item in r.json().get("jobs", []):
+                jobs.append(safe_normalize({
+                    "title":      item.get("jobTitle", ""),
+                    "company":    item.get("companyName", ""),
+                    "location":   item.get("jobGeo") or "Remote",
+                    "description":item.get("jobDescription", ""),
+                    "url":        item.get("url", ""),
+                    "salary_min": item.get("salaryMin"),
+                    "salary_max": item.get("salaryMax"),
+                    "posted_at":  item.get("pubDate"),
+                }, "jobicy"))
+        except Exception as e:
+            log.warning(f"Jobicy '{search_term}' failed: {e}")
+        time.sleep(0.3)
+    log.info(f"Jobicy: {len(jobs)} raw jobs")
+    return jobs
+    
 # ── YC DISCOVERY ─────────────────────────────────────────────────────────────
 
 _YC_OSS_BASE = "https://raw.githubusercontent.com/yc-oss/api/main/companies"
@@ -742,25 +819,13 @@ def fetch_yc_companies() -> list[dict]:
     return companies
 
 
-_YC_PROBE_CAP = 75
-
-
-def fetch_yc_discovered(seen_yc: set) -> tuple[list[dict], set]:
+def fetch_yc_discovered() -> list[dict]:
     companies = fetch_yc_companies()
-    new = [c for c in companies if c["slug"] not in seen_yc]
-    to_probe = new[:_YC_PROBE_CAP]
-
-    if len(new) > _YC_PROBE_CAP:
-        log.info(f"YC probe: {len(to_probe)} companies this run, {len(new) - len(to_probe)} deferred")
-    else:
-        log.info(f"YC probe: {len(to_probe)} new companies")
-
-    slugs = [c["slug"] for c in to_probe]
+    slugs = [c["slug"] for c in companies]
+    log.info(f"YC probe: {len(slugs)} companies")
     all_jobs = fetch_all_companies_parallel(slugs)
-    new_slugs = set(slugs)
-
-    log.info(f"YC discovered: {len(all_jobs)} raw jobs from {len(new_slugs)} companies")
-    return all_jobs, seen_yc | new_slugs
+    log.info(f"YC discovered: {len(all_jobs)} raw jobs from {len(slugs)} companies")
+    return all_jobs
 
 
 # ── OBJECTIVE FILTERING ───────────────────────────────────────────────────────
@@ -928,7 +993,6 @@ def main():
     log.info("Starting Job Scout...")
 
     seen_jobs = load_set(SEEN_JOBS_FILE)
-    seen_yc   = load_set(SEEN_YC_SLUGS_FILE)
 
     jobs: list[dict] = []
 
@@ -938,9 +1002,10 @@ def main():
     jobs += fetch_all_companies_parallel(ALL_COMPANIES)
 
     jobs += fetch_remotive()
-
-    yc_jobs, seen_yc = fetch_yc_discovered(seen_yc)
-    jobs += yc_jobs
+    jobs += fetch_himalayas()
+    jobs += fetch_jobicy()
+    
+    jobs += fetch_yc_discovered()
 
     # Deduplicate against seen jobs
     new_jobs: list[dict] = []
@@ -967,7 +1032,7 @@ def main():
     # Sort: named ATS companies first, then remotive, then adzuna noise last
     SOURCE_PRIORITY = {
         "greenhouse": 0, "lever": 0, "workable": 0, "ashby": 0, "rippling": 0,
-        "remotive": 1,
+        "remotive": 1, "himalayas": 1, "jobicy": 1,
         "adzuna": 2,
     }
 
@@ -997,7 +1062,6 @@ def main():
     send_digest(strong_matches)
 
     save_set(SEEN_JOBS_FILE, seen_jobs)
-    save_set(SEEN_YC_SLUGS_FILE, seen_yc)
 
     log.info("Job Scout complete.")
 
