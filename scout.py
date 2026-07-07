@@ -754,13 +754,12 @@ def fetch_jsearch() -> list[dict]:
     log.info("Fetching JSearch...")
     jobs = []
     headers = {
-        "x-rapidapi-host": "jsearch.p.rapidapi.com",
-        "x-rapidapi-key":  JSEARCH_API_KEY,
+        "X-API-Key": JSEARCH_API_KEY,
     }
     for query in JSEARCH_SEARCHES:
         try:
             r = requests.get(
-                "https://jsearch.p.rapidapi.com/search",
+                "https://api.openwebninja.com/jsearch/search-v2",
                 headers=headers,
                 params={
                     "query":       query,
