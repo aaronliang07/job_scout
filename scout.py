@@ -783,7 +783,7 @@ def fetch_jsearch() -> list[dict]:
                 }, "jsearch"))
         except Exception as e:
             log.warning(f"JSearch query '{query}' failed: {e}")
-        time.sleep(0.5)
+        time.sleep(2)
     log.info(f"JSearch: {len(jobs)} raw jobs")
     return jobs
     
