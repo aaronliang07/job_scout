@@ -35,6 +35,7 @@ ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 GMAIL_SENDER       = os.environ["GMAIL_SENDER"]
 GMAIL_RECIPIENT    = os.environ["GMAIL_RECIPIENT"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+JSEARCH_API_KEY = os.environ["JSEARCH_API_KEY"]
 
 SCORE_THRESHOLD = 8
 
@@ -223,8 +224,6 @@ REMOTIVE_SEARCHES = [
 ]
 
 # ── JSearch (RapidAPI) ────────────────────────────────────────────────────────
-
-JSEARCH_API_KEY = os.environ["JSEARCH_API_KEY"]
 
 JSEARCH_SEARCHES = [
     "product data analyst Toronto",
