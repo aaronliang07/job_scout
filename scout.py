@@ -769,7 +769,17 @@ def fetch_jsearch() -> list[dict]:
                 timeout=15,
             )
             r.raise_for_status()
-            log.info(f"JSearch raw response for '{query}': {r.text[:500]}")
+            for item in r.json().get("data", {}).get("jobs", []):
+                jobs.append(safe_normalize({
+                    "title":      item.get("job_title", ""),
+                    "company":    item.get("employer_name", ""),
+                    "location":   item.get("job_city", "") or item.get("job_country", ""),
+                    "description":item.get("job_description", ""),
+                    "url":        item.get("job_apply_link", ""),
+                    "salary_min": item.get("job_min_salary"),
+                    "salary_max": item.get("job_max_salary"),
+                    "posted_at":  item.get("job_posted_at_datetime_utc"),
+                }, "jsearch"))
         except Exception as e:
             log.warning(f"JSearch query '{query}' failed: {e}")
         time.sleep(2)
