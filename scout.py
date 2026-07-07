@@ -222,6 +222,18 @@ REMOTIVE_SEARCHES = [
     "product manager",
 ]
 
+# ── JSearch (RapidAPI) ────────────────────────────────────────────────────────
+
+JSEARCH_API_KEY = os.environ["JSEARCH_API_KEY"]
+
+JSEARCH_SEARCHES = [
+    "product data analyst Toronto",
+    "product manager Toronto",
+    "product analyst remote",
+    "business operations Toronto",
+    "data scientist product Toronto",
+]
+
 # ── Claude matching criteria ──────────────────────────────────────────────────
 
 MATCHING_CRITERIA = """
@@ -738,6 +750,43 @@ def fetch_jobicy() -> list[dict]:
         time.sleep(0.3)
     log.info(f"Jobicy: {len(jobs)} raw jobs")
     return jobs
+
+def fetch_jsearch() -> list[dict]:
+    log.info("Fetching JSearch...")
+    jobs = []
+    headers = {
+        "x-rapidapi-host": "jsearch.p.rapidapi.com",
+        "x-rapidapi-key":  JSEARCH_API_KEY,
+    }
+    for query in JSEARCH_SEARCHES:
+        try:
+            r = requests.get(
+                "https://jsearch.p.rapidapi.com/search",
+                headers=headers,
+                params={
+                    "query":       query,
+                    "num_results": "10",
+                    "date_posted": "3days",
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            for item in r.json().get("data", []):
+                jobs.append(safe_normalize({
+                    "title":      item.get("job_title", ""),
+                    "company":    item.get("employer_name", ""),
+                    "location":   item.get("job_city", "") or item.get("job_country", ""),
+                    "description":item.get("job_description", ""),
+                    "url":        item.get("job_apply_link", ""),
+                    "salary_min": item.get("job_min_salary"),
+                    "salary_max": item.get("job_max_salary"),
+                    "posted_at":  item.get("job_posted_at_datetime_utc"),
+                }, "jsearch"))
+        except Exception as e:
+            log.warning(f"JSearch query '{query}' failed: {e}")
+        time.sleep(0.5)
+    log.info(f"JSearch: {len(jobs)} raw jobs")
+    return jobs
     
 # ── YC DISCOVERY ─────────────────────────────────────────────────────────────
 
@@ -1004,6 +1053,7 @@ def main():
     jobs += fetch_remotive()
     jobs += fetch_himalayas()
     jobs += fetch_jobicy()
+    jobs += fetch_jsearch()
     
     jobs += fetch_yc_discovered()
 
@@ -1032,7 +1082,7 @@ def main():
     # Sort: named ATS companies first, then remotive, then adzuna noise last
     SOURCE_PRIORITY = {
         "greenhouse": 0, "lever": 0, "workable": 0, "ashby": 0, "rippling": 0,
-        "remotive": 1, "himalayas": 1, "jobicy": 1,
+        "remotive": 1, "himalayas": 1, "jobicy": 1, "jsearch": 1,
         "adzuna": 2,
     }
 
